@@ -13,27 +13,28 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/bstchow/go-chess-server/pkg/corenet"
 	"github.com/bstchow/go-chess-server/pkg/session"
 	"github.com/gorilla/websocket"
+	"github.com/notnil/chess"
 	"github.com/rivo/tview"
 )
 
 type matchResponse struct {
 	Type        string              `json:"type"`
 	SessionID   string              `json:"session_id"`
-	GameState   session.GameState   `json:"game_state"`
+	GameState   string              `json:"game_state"`
 	PlayerState session.PlayerState `json:"player_state"`
 }
 
 type User struct {
-	PrivyDID string `json:"privy_did"`
+	ID       string `json:"id"`
+	JWTToken string `json:"jwt_token"`
 }
 
-type LoginRequest struct {
+type PrivyLoginRequest struct {
 	PrivyJWTToken string `json:"privy_jwt_token"`
 }
 
@@ -47,11 +48,11 @@ type Session struct {
 }
 
 var (
-	app            *tview.Application
-	loginForm      *tview.Form
-	currentUser    *User
-	playerPrivyDid string
-	gameResult     string
+	app         *tview.Application
+	loginForm   *tview.Form
+	currentUser *User
+	gameResult  string
+	gameMessage string
 )
 
 func main() {
@@ -68,7 +69,7 @@ func setupForms(app *tview.Application) {
 		AddInputField("Privy JWT Token", "", 20, nil, nil).
 		AddButton("Login", func() {
 			privyJwtToken := loginForm.GetFormItemByLabel("Privy JWT Token").(*tview.InputField).GetText()
-			login(LoginRequest{privyJwtToken})
+			login(PrivyLoginRequest{privyJwtToken})
 		}).
 		AddButton("Back", func() {
 			app.SetRoot(mainMenu(), true).Run()
@@ -89,7 +90,7 @@ func mainMenu() *tview.Flex {
 		if currentUser == nil {
 			headerText.SetText("Please login to the server")
 		} else {
-			headerText.SetText(fmt.Sprintf("User: %s", currentUser.PrivyDID))
+			headerText.SetText(fmt.Sprintf("User: %s", currentUser.ID))
 		}
 	}
 
@@ -128,7 +129,7 @@ func postLoginMenu() *tview.Flex {
 		if currentUser == nil {
 			headerText.SetText("Please login to the server")
 		} else {
-			headerText.SetText(fmt.Sprintf("User: %s", currentUser.PrivyDID))
+			headerText.SetText(fmt.Sprintf("User: %s", currentUser.ID))
 		}
 	}
 
@@ -139,20 +140,20 @@ func postLoginMenu() *tview.Flex {
 			app.Stop()
 			app = tview.NewApplication()
 			gameResult = ""
+			gameMessage = ""
 			joinMatch()
 			if gameResult == "timeout" {
-				showMatchingErrorDialog("Matching timeout")
+				showMatchingErrorDialog("Matching timeout" + gameMessage)
 			} else if gameResult == "queueing" {
-				showMatchingErrorDialog("You are queueing elsewhere")
+				showMatchingErrorDialog("You are queueing elsewhere" + gameMessage)
 			} else if gameResult == "error" {
-				showMatchingErrorDialog("You are playing elsewhere")
+				showMatchingErrorDialog("You are playing elsewhere" + gameMessage)
 			} else {
-				showLoginSuccessDialog("Game ended with " + gameResult)
+				showLoginSuccessDialog("Game ended with " + gameResult + gameMessage)
 			}
 		}).
 		AddItem("Logout", "Logout from your account", '3', func() {
 			currentUser = nil
-			playerPrivyDid = ""
 			app.SetRoot(mainMenu(), true).Run()
 		})
 
@@ -195,8 +196,8 @@ func showLoginSuccessDialog(message string) {
 	app.SetRoot(modal, true).Run()
 }
 
-func login(loginRequest LoginRequest) {
-	url := "http://localhost:7202/api/login"
+func login(loginRequest PrivyLoginRequest) {
+	url := "http://localhost:7202/api/privyLogin"
 	userJSON, err := json.Marshal(loginRequest)
 	if err != nil {
 		showLoginErrorDialog(fmt.Sprintf("Error marshalling login request: %v", err))
@@ -223,14 +224,19 @@ func login(loginRequest LoginRequest) {
 		return
 	}
 
-	// Assuming the token is part of the response
-	ppid, ok := result["player_privy_did"].(string)
+	id, ok := result["user_id"].(string)
 	if !ok {
 		showLoginErrorDialog("Player ID not found in response")
 		return
 	}
-	currentUser = &User{PrivyDID: ppid}
-	playerPrivyDid = ppid
+
+	jwtToken, ok := result["jwt_token"].(string)
+	if !ok {
+		showLoginErrorDialog("JWT token not found in response")
+		return
+	}
+
+	currentUser = &User{ID: id, JWTToken: jwtToken}
 
 	showLoginSuccessDialog("Login successful!")
 }
@@ -255,7 +261,7 @@ func joinMatch() {
 		if err := c.WriteJSON(corenet.Message{
 			Action: "matching",
 			Data: map[string]interface{}{
-				"player_privy_did": playerPrivyDid,
+				"jwt_token": currentUser.JWTToken,
 			},
 		}); err != nil {
 			log.Fatal("ws write", err)
@@ -271,6 +277,7 @@ func joinMatch() {
 		}
 
 		if resp.Type != "matched" {
+
 			gameResult = resp.Type
 			return
 		}
@@ -279,19 +286,24 @@ func joinMatch() {
 			Type:      "session",
 			GameState: resp.GameState,
 		}
-		var state session.GameState
+		var state string
 		scanner := bufio.NewScanner(os.Stdin)
 		for {
 			if sessionResp.Type == "session" {
 				state = sessionResp.GameState
 			}
 			clearScreen()
-			printBoard(state.Board, resp.PlayerState.IsWhiteSide)
-			if state.Status != "ACTIVE" {
-				gameResult = state.Status
+			chessGameFenUpdate, err := chess.FEN(state)
+			if err != nil {
+				log.Fatal(err)
+			}
+			chessGame := chess.NewGame(chessGameFenUpdate)
+			fmt.Println(chessGame.Position().Board().Draw())
+			if chessGame.Outcome() != chess.NoOutcome {
+				gameResult = chessGame.Outcome().String()
 				return
 			}
-			if resp.PlayerState.IsWhiteSide == state.IsWhiteTurn {
+			if resp.PlayerState.IsWhiteSide == (chessGame.Position().Turn() == chess.White) {
 				if sessionResp.Type == "session" {
 					fmt.Print("Enter your move (e.g., e2-e4): ")
 				} else {
@@ -303,9 +315,9 @@ func joinMatch() {
 				c.WriteJSON(corenet.Message{
 					Action: "move",
 					Data: map[string]interface{}{
-						"session_id":       resp.SessionID,
-						"player_privy_did": playerPrivyDid,
-						"move":             move,
+						"session_id": resp.SessionID,
+						"jwt_token":  currentUser.JWTToken,
+						"move":       move,
 					},
 				})
 
@@ -340,68 +352,6 @@ func joinMatch() {
 			os.Exit(1)
 		}
 	}
-}
-
-func formatBoard(board [8][8]string) string {
-	var sb strings.Builder
-
-	sb.WriteString("  +-----------------+\n")
-	for i := 7; i >= 0; i-- {
-		sb.WriteString(fmt.Sprintf("%d | ", i+1))
-		for j := 0; j < 8; j++ {
-			box := board[j][i]
-			if box != "" {
-				sb.WriteString(box + " ")
-			} else {
-				sb.WriteString(". ")
-			}
-		}
-		sb.WriteString("|\n")
-	}
-	sb.WriteString("  +-----------------+\n")
-	sb.WriteString("    a b c d e f g h\n")
-
-	return sb.String()
-}
-
-func printBoard(board [8][8]string, isWhiteSide bool) {
-	fmt.Println("  +-----------------+")
-
-	if isWhiteSide {
-		for i := 7; i >= 0; i-- {
-			fmt.Printf("%d | ", i+1)
-			for j := 0; j < 8; j++ {
-				box := board[j][i]
-				if box != "" {
-					fmt.Print(box + " ")
-				} else {
-					fmt.Print(". ")
-				}
-			}
-			fmt.Println("|")
-		}
-
-		fmt.Println("  +-----------------+")
-		fmt.Println("    a b c d e f g h")
-	} else {
-		for i := 0; i < 8; i++ {
-			fmt.Printf("%d | ", i+1)
-			for j := 7; j >= 0; j-- {
-				box := board[j][i]
-				if box != "" {
-					fmt.Print(box + " ")
-				} else {
-					fmt.Print(". ")
-				}
-			}
-			fmt.Println("|")
-		}
-
-		fmt.Println("  +-----------------+")
-		fmt.Println("    h g f e d c b a ")
-	}
-
-	fmt.Println()
 }
 
 func clearScreen() {

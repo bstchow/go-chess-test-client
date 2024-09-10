@@ -5,8 +5,8 @@ go 1.22.3
 require (
 	github.com/bstchow/go-chess-server v0.0.0-20240901191951-c0ac6dfe3c47
 	github.com/gorilla/websocket v1.5.3
+	github.com/notnil/chess v1.9.0
 	github.com/rivo/tview v0.0.0-20240818110301-fd649dbf1223
-
 )
 
 require (
